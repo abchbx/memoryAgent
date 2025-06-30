@@ -6,6 +6,7 @@ import os
 import json
 import logging
 import time
+import datetime
 import streamlit as st
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -13,7 +14,7 @@ import chromadb
 from chromadb.utils import embedding_functions
 
 # -----------------------------------------------------------------------------
-# 步骤 2: 后端逻辑代码 (V2.11 - 记忆存储优化版)
+# 步骤 2: 后端逻辑代码 (V3.1 - 缓存修复版)
 # -----------------------------------------------------------------------------
 
 # --- 日志记录配置 ---
@@ -28,16 +29,23 @@ class Config:
     EMBEDDING_MODEL = "BAAI/bge-base-zh-v1.5"
     DB_PATH = "/workspace/memoryAgent/user_centric_db_v3"
     CHAT_COLLECTION_NAME = "user_chat_history"
-    MEMORY_COLLECTION_NAME = "user_entity_memory"
+    FACT_MEMORY_COLLECTION_NAME = "user_fact_memory" # V3.0: 名字变更，更清晰
+    EVENT_MEMORY_COLLECTION_NAME = "user_event_memory" # V3.0: 新增事件记忆集合
     RAG_COLLECTION_NAME = "user_rag_documents"
 
+    # V3.0: System-Prompt 升级，增加了事件记忆模块
     SYSTEM_PROMPT_TEMPLATE = """
     你是为用户 {user_id} 服务的顶级个人智能助手，拥有卓越的记忆、推理和知识库查询能力。
-    # 关于用户 {user_id} 的已知信息 (你的长期记忆):
+
+    # 关于用户 {user_id} 的已知事实 (你的静态记忆):
     {long_term_memory}
+
+    # 关于用户 {user_id} 的相关事件与计划 (你的动态记忆):
+    {event_memory}
+
     # 你的工作流程:
     1.  **深入理解**: 分析用户的最新问题。
-    2.  **结合记忆与知识**: 我会为你提供三类信息：用户的长期记忆、相关的历史对话、以及从用户上传的知识库中检索到的相关资料。你必须将这三者结合起来，形成对上下文的完整理解。
+    2.  **结合记忆与知识**: 我会为你提供三类信息：用户的长期记忆(事实和事件)、相关的历史对话、以及从用户上传的知识库中检索到的相关资料。你必须将这三者结合起来，形成对上下文的完整理解。
     3.  **优先使用知识库**: 如果知识库中提供了与问题直接相关的信息，请优先基于这些信息进行回答，因为它们是用户指定的权威资料。
     4.  **个性化回答**: 基于所有信息，为用户 {user_id} 生成一个富有洞察力、连贯且个性化的回答。
     """
@@ -46,6 +54,7 @@ class Config:
 
 # --- 文本分割器 ---
 def simple_text_splitter(text: str, max_chunk_size: int = 500) -> list[str]:
+    """一个简单的文本分割器，按句子分割"""
     sentences = text.replace("\n", " ").replace("\r", " ").split('。')
     chunks, current_chunk = [], ""
     for sentence in sentences:
@@ -70,7 +79,8 @@ class ChatHistoryDB:
                 model_name=self.config.EMBEDDING_MODEL
             )
             self.chat_collection = self.db_client.get_or_create_collection(name=self.config.CHAT_COLLECTION_NAME, embedding_function=self.embedding_func)
-            self.memory_collection = self.db_client.get_or_create_collection(name=self.config.MEMORY_COLLECTION_NAME, embedding_function=self.embedding_func)
+            self.fact_memory_collection = self.db_client.get_or_create_collection(name=self.config.FACT_MEMORY_COLLECTION_NAME, embedding_function=self.embedding_func)
+            self.event_memory_collection = self.db_client.get_or_create_collection(name=self.config.EVENT_MEMORY_COLLECTION_NAME, embedding_function=self.embedding_func) # V3.0: 初始化事件集合
             self.rag_collection = self.db_client.get_or_create_collection(name=self.config.RAG_COLLECTION_NAME, embedding_function=self.embedding_func)
             logging.info(f"数据库初始化成功: {config.DB_PATH}")
         except Exception as e:
@@ -79,17 +89,15 @@ class ChatHistoryDB:
             raise
 
     def add_document_to_rag(self, user_id: str, file_name: str, file_content: str, progress_callback=None):
-        if progress_callback:
-            progress_callback(0, "步骤 1/2: 正在分割文件...")
+        if progress_callback: progress_callback(0, "步骤 1/2: 正在分割文件...")
         chunks = simple_text_splitter(file_content)
-        if not chunks: 
+        if not chunks:
             if progress_callback: progress_callback(100, "文件内容为空，已跳过。")
             return
 
         total_chunks = len(chunks)
         logging.info(f"文件 '{file_name}' 被分割成 {total_chunks} 个片段。")
-        if progress_callback:
-            progress_callback(5, f"步骤 2/2: 分割完成，准备计算向量... (共 {total_chunks} 块)")
+        if progress_callback: progress_callback(5, f"步骤 2/2: 分割完成，准备计算向量... (共 {total_chunks} 块)")
         
         batch_size = 32
         for i in range(0, total_chunks, batch_size):
@@ -105,8 +113,7 @@ class ChatHistoryDB:
                 status_text = f"步骤 2/2: 正在计算向量... ({processed_count}/{total_chunks})"
                 progress_callback(percentage, status_text)
         
-        if progress_callback:
-            progress_callback(100, "知识库学习完成！")
+        if progress_callback: progress_callback(100, "知识库学习完成！")
         logging.info(f"文件 '{file_name}' 已成功添加至知识库。")
 
     def save_message(self, user_id: str, message: dict):
@@ -127,39 +134,88 @@ class ChatHistoryDB:
             self.chat_collection.delete(where={"user_id": user_id})
             logging.info(f"已清空用户 {user_id} 的对话历史。")
             
-    # ⭐ V2.11 核心优化: 优化记忆存储逻辑
-    def save_entities_to_memory(self, user_id: str, entities: dict):
-        """
-        保存或更新实体到长期记忆库。
-        如果实体值是一个字典, 会将其展开并逐一存储。
-        """
-        if not entities: return
+    # V3.0: 重构此函数以同时处理事实和事件
+    def save_structured_memory(self, user_id: str, memory_data: dict):
+        """保存结构化的记忆，包括静态事实和动态事件"""
+        # 1. 保存静态事实
+        facts = memory_data.get('static_facts', {})
+        if facts and isinstance(facts, dict):
+            logging.info(f"正在为用户 {user_id} 保存或更新 {len(facts)} 条事实记忆...")
+            items_to_save = []
+            for key, value in facts.items():
+                if isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        items_to_save.append((f"{key}_{sub_key}", sub_value))
+                else:
+                    items_to_save.append((key, value))
+            
+            for key, value in items_to_save:
+                doc_id = f"fact_{user_id}_{key}"
+                self.fact_memory_collection.upsert(
+                    ids=[doc_id],
+                    documents=[f"用户的个人信息：{key} 是 {value}。"],
+                    metadatas=[{"user_id": user_id, "key": key, "timestamp": time.time()}]
+                )
+
+        # 2. 保存动态事件
+        events = memory_data.get('events', [])
+        if events and isinstance(events, list):
+            logging.info(f"正在为用户 {user_id} 保存 {len(events)} 条事件记忆...")
+            for event in events:
+                if isinstance(event, dict) and 'description' in event:
+                    description = event['description']
+                    event_time_str = event.get('event_time', '未知时间')
+                    doc_id = f"event_{user_id}_{time.time()}"
+                    self.event_memory_collection.add(
+                        ids=[doc_id],
+                        documents=[f"事件：{description}，发生时间：{event_time_str}"],
+                        metadatas={"user_id": user_id, "event_time": event_time_str, "saved_at": time.time()}
+                    )
+
+    def load_fact_memory(self, user_id: str, top_k: int = 20) -> str:
+        """加载静态事实记忆"""
+        results = self.fact_memory_collection.get(where={"user_id": user_id}, limit=top_k)
+        return "\n".join(f"- {doc}" for doc in results.get('documents', [])) or "暂无"
+    
+    # V3.0: 新增函数，用于加载和智能筛选事件记忆
+    def load_event_memory(self, user_id: str, query: str = None, top_k_similar: int = 3, past_k_recent: int = 5) -> str:
+        """加载与用户相关的事件记忆，包括未来的、最近发生的和与查询相关的"""
+        if not user_id: return "暂无"
         
-        items_to_save = []
-        for key, value in entities.items():
-            # 如果值是字典, 就把它拆开
-            if isinstance(value, dict):
-                for sub_key, sub_value in value.items():
-                    items_to_save.append((sub_key, sub_value))
-            else:
-                items_to_save.append((key, value))
+        all_events = self.event_memory_collection.get(where={"user_id": user_id})
+        if not all_events['ids']: return "暂无"
 
-        if not items_to_save: return
-
-        logging.info(f"正在为用户 {user_id} 保存或更新 {len(items_to_save)} 条记忆...")
-        for key, value in items_to_save:
-            doc_id = f"memory_{user_id}_{key}"
-            # 现在存储的是独立的键值对
-            self.memory_collection.upsert(
-                ids=[doc_id], 
-                documents=[f"用户的个人信息：{key} 是 {value}。"], 
-                metadatas=[{"user_id": user_id, "key": key, "timestamp": time.time()}]
-            )
-
-    def load_long_term_memory(self, user_id: str, top_k: int = 20) -> str:
-        results = self.memory_collection.get(where={"user_id": user_id}, limit=top_k)
-        return "\n".join(results.get('documents', [])) or "暂无"
+        # 简单的未来事件识别 (实际应用中可能需要更复杂的日期解析)
+        future_events = [doc for doc in all_events['documents'] if any(kw in doc for kw in ["明天", "下周", "将要", "计划"])]
         
+        # 获取最近发生的事件
+        sorted_events = sorted(zip(all_events['documents'], all_events['metadatas']), key=lambda x: x[1]['saved_at'], reverse=True)
+        recent_past_events = [doc for doc, meta in sorted_events[:past_k_recent]]
+
+        # 获取与当前查询最相关的事件
+        similar_events = []
+        if query:
+            query_results = self.event_memory_collection.query(query_texts=[query], where={"user_id": user_id}, n_results=top_k_similar)
+            similar_events = query_results.get("documents", [[]])[0]
+
+        # 合并并去重
+        final_events = []
+        for event_list in [future_events, recent_past_events, similar_events]:
+            for event in event_list:
+                if event not in final_events:
+                    final_events.append(event)
+
+        return "\n".join(f"- {event}" for event in final_events) or "暂无"
+
+    def get_all_event_memory_for_display(self, user_id: str) -> str:
+        """获取所有事件记忆用于UI展示"""
+        results = self.event_memory_collection.get(where={"user_id": user_id})
+        if not results['ids']: return "暂无事件记忆。"
+        
+        sorted_events = sorted(zip(results['documents'], results['metadatas']), key=lambda x: x[1]['saved_at'], reverse=True)
+        return "\n".join(doc for doc, meta in sorted_events)
+
+
     def clear_user_rag_documents(self, user_id: str):
         if self.rag_collection.get(where={"user_id": user_id})['ids']:
             self.rag_collection.delete(where={"user_id": user_id})
@@ -196,56 +252,107 @@ class ChatAgent:
         self.client = OpenAI(api_key=api_key, base_url=self.config.ZHIPU_BASE_URL)
         self.refresh_agent_state()
 
-    def refresh_agent_state(self):
-        long_term_memory = self.db_manager.load_long_term_memory(self.user_id)
-        system_prompt = self.config.SYSTEM_PROMPT_TEMPLATE.format(user_id=self.user_id, long_term_memory=long_term_memory)
+    def refresh_agent_state(self, query: str = None):
+        """刷新代理状态，加载所有类型的记忆"""
+        fact_memory = self.db_manager.load_fact_memory(self.user_id)
+        event_memory = self.db_manager.load_event_memory(self.user_id, query=query) # V3.0: 加载事件记忆
+        
+        system_prompt = self.config.SYSTEM_PROMPT_TEMPLATE.format(
+            user_id=self.user_id, 
+            long_term_memory=fact_memory,
+            event_memory=event_memory
+        )
+        
         self.messages = self.db_manager.load_history_by_user(self.user_id)
         if not self.messages or self.messages[0]['role'] != 'system':
             self.messages.insert(0, {"role": "system", "content": system_prompt})
-        else: self.messages[0] = {"role": "system", "content": system_prompt}
+        else: 
+            self.messages[0]['content'] = system_prompt
 
     def run(self, user_input: str):
+        # V3.0: 在运行前，根据用户输入刷新一次记忆状态，以获取最相关的事件
+        self.refresh_agent_state(query=user_input)
+        
         context_from_rag = self.db_manager.query_rag_documents(self.user_id, user_input)
         context_from_history = self.db_manager.query_recent_discussions(self.user_id, user_input)
+        
         messages_for_llm = list(self.messages)
-        if context_from_rag: messages_for_llm.append({"role": "system", "content": context_from_rag})
-        if context_from_history: messages_for_llm.append({"role": "system", "content": context_from_history})
+        if context_from_rag: messages_for_llm.append({"role": "system", "content": f"补充信息-知识库检索:\n{context_from_rag}"})
+        if context_from_history: messages_for_llm.append({"role": "system", "content": f"补充信息-历史对话回顾:\n{context_from_history}"})
+        
         messages_for_llm.append({"role": "user", "content": user_input})
+        
         try:
             response = self.client.chat.completions.create(model=self.config.LLM_MODEL, messages=messages_for_llm)
             final_response = response.choices[0].message.content or "抱歉，我不知道如何回复。"
         except Exception as e:
             logging.error(f"调用LLM API失败: {e}")
             final_response = f"抱歉，出错了: {e}"
+            
         user_message = {"role": "user", "content": user_input}
         assistant_message = {"role": "assistant", "content": final_response}
+        
         self.db_manager.save_message(self.user_id, user_message)
         self.db_manager.save_message(self.user_id, assistant_message)
+        
         self.messages.extend([user_message, assistant_message])
+        
         user_message_count = sum(1 for msg in self.messages if msg['role'] == 'user')
         if user_message_count > 0 and user_message_count % self.config.MEMORY_EXTRACTION_INTERVAL == 0:
-            self.extract_and_save_memory(is_periodic=True)
+            self.extract_and_save_memory()
+            
         return final_response
 
-    def extract_and_save_memory(self, is_periodic=False):
+    # V3.0: 核心函数升级，提取事实和事件
+    def extract_and_save_memory(self):
         conversation = [msg for msg in self.messages if msg['role'] in ['user', 'assistant']]
         if len(conversation) < 2: return False
+        
         full_chat_content = "\n".join([f"{m['role']}: {m['content']}" for m in conversation])
-        memory_prompt = f"""请仔细阅读用户 {self.user_id} 的对话，并以JSON格式，提炼出关于该用户的【核心事实】、【长期偏好】或【自定义状态】。
-这些信息应是关键且值得长期记忆的。
-例如：姓名、职业、爱好、喜欢的颜色、角色扮演状态如“炼气期”、特定目标等。
-如果新信息与旧信息冲突，请只保留最新的。如果对话中没有发现任何此类信息，请返回一个空的JSON对象 {{}}。
-对话内容:
----
-{full_chat_content}
----
-提取的JSON:"""
+        
+        memory_prompt = f"""
+        请仔细阅读用户 {self.user_id} 的对话，并以JSON格式，提炼出两种信息：
+        1.  `static_facts`: 关于用户的【核心事实】、【长期偏好】或【自定义状态】。这些信息是相对稳定的。例如：姓名、职业、爱好、喜欢的颜色、角色扮演状态如“炼气期”、特定目标等。如果新信息与旧信息冲突，请只保留最新的。
+        2.  `events`: 对话中提到的【动态事件】或【未来计划】。每个事件应包含`description`（事件描述）和`event_time`（预估的发生时间，如'2024-08-15 10:00'或'下周三'）。
+
+        如果对话中没有发现任何此类信息，请返回一个空的JSON对象 {{}}。
+
+        对话内容:
+        ---
+        {full_chat_content}
+        ---
+        提取的JSON格式示例:
+        {{
+          "static_facts": {{
+            "姓名": "张三",
+            "职业": "软件工程师",
+            "宠物": "一只名叫'旺财'的狗"
+          }},
+          "events": [
+            {{
+              "description": "下周要去北京出差",
+              "event_time": "下周"
+            }},
+            {{
+              "description": "完成了项目A的报告",
+              "event_time": "昨天"
+            }}
+          ]
+        }}
+        ---
+        提取的JSON:
+        """
+        
         try:
-            response = self.client.chat.completions.create(model=self.config.LLM_MODEL, messages=[{"role": "user", "content": memory_prompt}], response_format={"type": "json_object"})
+            response = self.client.chat.completions.create(
+                model=self.config.LLM_MODEL, 
+                messages=[{"role": "user", "content": memory_prompt}], 
+                response_format={"type": "json_object"}
+            )
             content = response.choices[0].message.content
             if content and (extracted_data := json.loads(content)):
-                self.db_manager.save_entities_to_memory(self.user_id, extracted_data)
-                self.refresh_agent_state()
+                self.db_manager.save_structured_memory(self.user_id, extracted_data)
+                self.refresh_agent_state() # 保存后立即刷新，确保下一轮对话生效
                 return True
             return False
         except Exception as e:
@@ -253,10 +360,10 @@ class ChatAgent:
             return False
 
 # -----------------------------------------------------------------------------
-# 步骤 3: Streamlit 前端界面 (V2.11 - 无需改动)
+# 步骤 3: Streamlit 前端界面 (V3.1 - 增加缓存清理工具)
 # -----------------------------------------------------------------------------
 
-st.set_page_config(page_title="您的专属记忆助理 V2.11", page_icon="🧠", layout="centered")
+st.set_page_config(page_title="您的专属记忆助理 V3.1", page_icon="🧠", layout="centered")
 
 @st.cache_resource
 def get_core_services():
@@ -321,11 +428,21 @@ with st.sidebar:
 
         st.markdown("---")
         st.header("🛠️ 记忆工具箱")
+        
+        # V3.1: 新增缓存清理按钮，用于开发和调试
+        if st.button("🔄 清理应用缓存", key="clear_app_cache", help="当应用行为异常或代码更新后未生效时，可尝试清理缓存。"):
+            st.cache_resource.clear()
+            st.cache_data.clear()
+            st.session_state.agent = None # 强制重新初始化agent
+            st.toast("应用缓存已清理！应用将重新加载。", icon="♻️")
+            time.sleep(1) # 短暂延迟以确保用户能看到提示
+            st.rerun()
+
         if st.button("🧠 主动提炼记忆", key="extract_memory"):
             if st.session_state.agent:
                 status_placeholder = st.empty()
-                status_placeholder.info("⏳ 正在分析和沉淀记忆...")
-                saved = st.session_state.agent.extract_and_save_memory()
+                with st.spinner("⏳ 正在分析和沉淀记忆..."):
+                    saved = st.session_state.agent.extract_and_save_memory()
                 if saved:
                     status_placeholder.success("✅ 记忆已更新！")
                 else:
@@ -343,13 +460,20 @@ with st.sidebar:
                 st.session_state.agent = None
                 st.toast("对话历史已清空！", icon="🗑️")
                 st.rerun()
-        with st.expander("👀 查看我的长期记忆"):
-            memory_content = db_manager.load_long_term_memory(current_user_id)
-            st.code(memory_content, language=None) if memory_content.strip() and memory_content != "暂无" else st.info("暂无长期记忆。")
+        
+        # V3.0: 拆分记忆展示
+        with st.expander("👀 查看我的静态事实"):
+            memory_content = db_manager.load_fact_memory(current_user_id)
+            st.code(memory_content, language=None) if memory_content.strip() and memory_content != "暂无" else st.info("暂无静态事实记忆。")
+
+        with st.expander("📅 查看我的事件记忆"):
+            event_memory_content = db_manager.get_all_event_memory_for_display(current_user_id)
+            st.code(event_memory_content, language=None) if event_memory_content.strip() and "暂无" not in event_memory_content else st.info("暂无事件记忆。")
+
     else: st.caption("请先登录以使用全部功能。")
 
 # --- 主聊天界面 ---
-st.title("🧠 您的专属记忆助理 V2.11")
+st.title("🧠 您的专属记忆助理 V3.1")
 if not st.session_state.logged_in_user_id:
     st.info("👈 请在左侧边栏输入用户ID并登录。")
     st.stop()
@@ -359,9 +483,12 @@ try:
 except Exception as e:
     st.error(f"初始化助理出错: {e}")
     st.stop()
+
+# 仅显示用户和助手的消息
 for message in st.session_state.agent.messages:
     if message["role"] in ["user", "assistant"]:
         with st.chat_message(message["role"]): st.markdown(message["content"])
+
 if prompt := st.chat_input(f"您好, {st.session_state.logged_in_user_id}, 有何贵干?"):
     st.chat_message("user").markdown(prompt)
     with st.spinner("思考中..."):
