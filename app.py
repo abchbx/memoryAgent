@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
 # -----------------------------------------------------------------------------
-# 您的专属记忆助理 V4.6 - 上传属性修复版
+# 您的专属记忆伙伴 V4.9 - 时区修复版
 #
-# 更新日志 (V4.6):
-# - BUG修复: 修复了因使用错误的 `UploadedFile.id` 属性导致的 `AttributeError`。现在使用正确的 `UploadedFile.file_id`。
+# 更新日志 (V4.9):
+# - BUG修复: 彻底解决了因混合“有/无时区信息”的datetime对象而导致的 `TypeError`。
+# - 统一时间标准: 所有时间在处理前都会被统一转换为“有时区信息”的格式，杜绝了比较错误。
+# - 增强兼容性: 优化了时间解析逻辑，提高了对不同时间格式的兼容性。
 #
-# 更新日志 (V4.5):
-# - BUG修复: 修复了文件上传后因 `st.rerun()` 导致的重复处理问题。
-#
-# 更新日志 (V4.4):
-# - 核心逻辑重构: 区分了“永久性静态事实”和“临时性事实”。
-# - 登录优化: 登录时只会清理过期的“临时性事实”，用户的核心偏好和身份信息将被永久保留。
-# - AI能力升级: 优化了记忆提取的Prompt，使AI能更准确地分类不同类型的事实。
+# 更新日志 (V4.8):
+# - AI角色重塑: 将AI从“知识助手”转变为“私人伙伴”，优化交互体验。
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -30,7 +27,7 @@ import chromadb
 from chromadb.utils import embedding_functions
 
 # -----------------------------------------------------------------------------
-# 步骤 2: 后端逻辑代码 (V4.6 - 上传属性修复版)
+# 步骤 2: 后端逻辑代码 (V4.9 - 时区修复版)
 # -----------------------------------------------------------------------------
 
 # --- 日志记录配置 ---
@@ -43,7 +40,7 @@ class Config:
     ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
     LLM_MODEL = "glm-4-flash"
     EMBEDDING_MODEL = "BAAI/bge-base-zh-v1.5"
-    DB_PATH = "/workspace/memoryAgent/user_centric_db_v4.6" # V4.6: 数据库路径更新
+    DB_PATH = "/workspace/memoryAgent/user_centric_db_v4.9" # V4.9: 数据库路径更新
     CHAT_COLLECTION_NAME = "user_chat_history"
     FACT_MEMORY_COLLECTION_NAME = "user_fact_memory"
     EVENT_MEMORY_COLLECTION_NAME = "user_event_memory"
@@ -51,27 +48,24 @@ class Config:
     TIMEZONE = "Asia/Shanghai"
 
     SYSTEM_PROMPT_TEMPLATE = """
-    你是为用户 {user_id} 服务的顶级个人智能助手。
+    你是一位为用户 {user_id} 服务的、充满温度与支持的私人伙伴。
 
-    # 当前时间: {current_time}
+    # 你的核心角色:
+    - **成为伙伴, 而非老师**: 你的首要目标是成为一个乐于助人、有同理心的伙伴。你的角色不是纠正用户的错误，而是陪伴和支持他们梳理思绪、规划生活。
+    - **积极、鼓励、有温度**: 始终保持积极和鼓励的态度。在回应时，多一些关心和理解，少一些生硬的指令和说教。
+    - **个性化互动**: 像一个真正的朋友一样，自然地运用我为你提供的所有信息（用户的个人事实、事件记忆、知识库等），以便更好地理解上下文，并给出贴心、个性化的回应。
 
-    # 关于用户 {user_id} 的已知事实 (你的静态记忆):
-    {long_term_memory}
+    # 参考信息 (我会为你提供):
+    - **当前时间**: {current_time}
+    - **关于用户的记忆**:
+        - **长期事实**: {long_term_memory}
+        - **未来计划**: {future_events}
+        - **近期事件**: {past_events}
 
-    # 关于用户 {user_id} 的相关事件与计划 (你的动态记忆):
-    ## 未来计划 (按时间正序):
-    {future_events}
-    ## 最近发生的事件 (按时间倒序):
-    {past_events}
-
-    # 你的工作流程:
-    1.  **深入理解**: 结合当前时间，分析用户的最新问题。
-    2.  **整合信息**: 我会为你提供用户的长期事实记忆、按时间排序的事件记忆、相关的历史对话、以及知识库资料。你必须将这些信息全部整合，形成对上下文的完整理解。
-    3.  **优先使用知识库**: 如果知识库信息与问题直接相关，优先基于这些信息回答。
-    4.  **个性化回答**: 基于所有信息，为用户 {user_id} 生成一个富有洞察力、连贯且个性化的回答。
+    # 你的回应方式:
+    - 深入理解用户的意图，结合所有已知信息，生成一个自然、流畅、且充满伙伴感的回答。
+    - 如果知识库信息相关，请以一种建议或“我发现这个可能有用”的口吻来分享，而不是作为绝对事实。
     """
-    
-    MEMORY_EXTRACTION_INTERVAL = 4
 
 # --- 文本分割器 ---
 def simple_text_splitter(text: str, max_chunk_size: int = 500) -> list[str]:
@@ -173,7 +167,6 @@ class ChatHistoryDB:
         ids_to_delete = [
             results['ids'][i] 
             for i, meta in enumerate(results['metadatas']) 
-            # 核心条件: 只删除 (is_permanent不为True) 且 (时间戳早于今天) 的记忆
             if meta.get('is_permanent') is not True and meta.get('timestamp') and meta['timestamp'] < today_start_timestamp
         ]
 
@@ -188,8 +181,7 @@ class ChatHistoryDB:
         """保存结构化的记忆，区分永久事实、临时事实和动态事件"""
 
         def _save_facts(facts: dict, is_permanent: bool):
-            if not (facts and isinstance(facts, dict)):
-                return
+            if not (facts and isinstance(facts, dict)): return
             
             fact_type_str = "永久" if is_permanent else "临时"
             logging.info(f"正在为用户 {user_id} 保存或更新 {len(facts)} 条{fact_type_str}事实记忆...")
@@ -207,25 +199,17 @@ class ChatHistoryDB:
                 self.fact_memory_collection.upsert(
                     ids=[doc_id],
                     documents=[f"用户的个人信息：{key} 是 {value}。"],
-                    metadatas=[{
-                        "user_id": user_id, 
-                        "key": key, 
-                        "timestamp": time.time(),
-                        "is_permanent": is_permanent  # 新增的关键元数据字段
-                    }]
+                    metadatas=[{"user_id": user_id, "key": key, "timestamp": time.time(), "is_permanent": is_permanent}]
                 )
 
-        # 处理永久性事实
         permanent_facts = memory_data.get('permanent_facts', {})
         _save_facts(permanent_facts, is_permanent=True)
 
-        # 处理临时性事实 (并兼容旧的 static_facts 键)
         temporal_facts = memory_data.get('temporal_facts', {})
         if not temporal_facts and 'static_facts' in memory_data:
-             temporal_facts = memory_data.get('static_facts', {}) # 向后兼容
+             temporal_facts = memory_data.get('static_facts', {})
         _save_facts(temporal_facts, is_permanent=False)
 
-        # 事件处理逻辑保持不变
         events = memory_data.get('events', [])
         if events and isinstance(events, list):
             logging.info(f"正在为用户 {user_id} 保存 {len(events)} 条事件记忆...")
@@ -233,16 +217,14 @@ class ChatHistoryDB:
                 if isinstance(event, dict) and 'description' in event and 'event_time_iso' in event:
                     description = event['description']
                     event_time_iso = event['event_time_iso']
-                    event_time_desc = event.get('event_time_desc', '未知时间')
                     
                     doc_id = f"event_{user_id}_{time.time()}"
                     self.event_memory_collection.add(
                         ids=[doc_id],
-                        documents=[f"事件: {description} (时间: {event_time_desc})"],
+                        documents=[description],
                         metadatas={
                             "user_id": user_id, 
                             "event_time_iso": event_time_iso,
-                            "event_time_desc": event_time_desc,
                             "saved_at": time.time()
                         }
                     )
@@ -253,10 +235,7 @@ class ChatHistoryDB:
         return "\n".join(f"- {doc}" for doc in results.get('documents', [])) or "暂无"
     
     def load_event_memory(self, user_id: str, query: str = None) -> tuple[str, str]:
-        """
-        加载与用户相关的事件记忆，精确区分未来和过去。
-        返回一个元组: (未来事件字符串, 过去事件字符串)
-        """
+        """加载与用户相关的事件记忆，精确区分未来和过去，并格式化为清晰的字符串。"""
         if not user_id: return "暂无", "暂无"
         
         all_events_result = self.event_memory_collection.get(where={"user_id": user_id})
@@ -270,10 +249,12 @@ class ChatHistoryDB:
             if not event_time_iso: continue
             
             try:
-                if 'Z' in event_time_iso or '+' in event_time_iso or '-' in event_time_iso[10:]:
-                    event_dt = datetime.datetime.fromisoformat(event_time_iso)
+                # --- 修复点: 统一解析并确保时间对象是 "aware" ---
+                parsed_dt = datetime.datetime.fromisoformat(event_time_iso.replace('Z', '+00:00'))
+                if parsed_dt.tzinfo is None:
+                    event_dt = self.tz.localize(parsed_dt)
                 else:
-                    event_dt = self.tz.localize(datetime.datetime.fromisoformat(event_time_iso))
+                    event_dt = parsed_dt
             except (ValueError, TypeError):
                 continue
 
@@ -286,28 +267,51 @@ class ChatHistoryDB:
         future_events.sort(key=lambda x: x[0])
         past_events.sort(key=lambda x: x[0], reverse=True)
 
-        future_str = "\n".join(f"- {doc} (时间: {dt.strftime('%Y-%m-%d %H:%M')})" for dt, doc in future_events) or "暂无"
-        past_str = "\n".join(f"- {doc} (时间: {dt.strftime('%Y-%m-%d %H:%M')})" for dt, doc in past_events[:5]) or "暂无"
+        future_str = "\n".join(f"- {doc} (时间: {dt.astimezone(self.tz).strftime('%Y-%m-%d %H:%M')})" for dt, doc in future_events) or "暂无"
+        past_str = "\n".join(f"- {doc} (时间: {dt.astimezone(self.tz).strftime('%Y-%m-%d %H:%M')})" for dt, doc in past_events[:5]) or "暂无"
 
         return future_str, past_str
 
     def get_all_event_memory_for_display(self, user_id: str) -> str:
-        """获取所有事件记忆用于UI展示，并按时间排序"""
+        """获取所有事件记忆用于UI展示，并按时间排序，显示具体时间。"""
         results = self.event_memory_collection.get(where={"user_id": user_id})
         if not results['ids']: return "暂无事件记忆。"
         
         events_with_time = []
+        # --- 修复点: 创建一个带时区的最小时间作为备用 ---
+        aware_min_dt = datetime.datetime.min.replace(tzinfo=pytz.utc)
+
         for i, meta in enumerate(results['metadatas']):
             event_time_iso = meta.get('event_time_iso')
             doc = results['documents'][i]
-            try:
-                dt = datetime.datetime.fromisoformat(event_time_iso.replace('Z', '+00:00')) if event_time_iso else datetime.datetime.min
-                events_with_time.append((dt, doc))
-            except ValueError:
-                events_with_time.append((datetime.datetime.min, f"{doc} (时间解析失败: {event_time_iso})"))
+            dt = aware_min_dt # 默认使用备用时间
+            
+            if event_time_iso:
+                try:
+                    # --- 修复点: 统一解析并确保时间对象是 "aware" ---
+                    parsed_dt = datetime.datetime.fromisoformat(event_time_iso.replace('Z', '+00:00'))
+                    if parsed_dt.tzinfo is None:
+                        dt = self.tz.localize(parsed_dt)
+                    else:
+                        dt = parsed_dt
+                except (ValueError, TypeError):
+                    doc = f"{doc} (时间解析失败: {event_time_iso})"
+            
+            events_with_time.append((dt, doc))
         
+        # 现在排序是安全的
         events_with_time.sort(key=lambda x: x[0], reverse=True)
-        return "\n".join(f"{doc}" for dt, doc in events_with_time)
+        
+        # --- 修复点: 优化显示逻辑 ---
+        formatted_events = []
+        for dt, doc in events_with_time:
+            if dt == aware_min_dt:
+                formatted_events.append(f"- {doc}") # 对于解析失败的，不显示日期
+            else:
+                local_dt = dt.astimezone(self.tz)
+                formatted_events.append(f"- {doc} (时间: {local_dt.strftime('%Y-%m-%d %H:%M')})")
+
+        return "\n".join(formatted_events) or "暂无事件记忆。"
 
     def clear_user_rag_documents(self, user_id: str):
         if self.rag_collection.get(where={"user_id": user_id})['ids']:
@@ -373,8 +377,8 @@ class ChatAgent:
         context_from_history = self.db_manager.query_recent_discussions(self.user_id, user_input)
         
         messages_for_llm = list(self.messages)
-        if context_from_rag: messages_for_llm.append({"role": "system", "content": f"补充信息-知识库检索:\n{context_from_rag}"})
-        if context_from_history: messages_for_llm.append({"role": "system", "content": f"补充信息-历史对话回顾:\n{context_from_history}"})
+        if context_from_rag: messages_for_llm.append({"role": "system", "content": f"补充信息(来自你的知识库，可以参考一下):\n{context_from_rag}"})
+        if context_from_history: messages_for_llm.append({"role": "system", "content": f"补充信息(来自我们的历史对话，也许能派上用场):\n{context_from_history}"})
         
         messages_for_llm.append({"role": "user", "content": user_input})
         
@@ -393,9 +397,7 @@ class ChatAgent:
         
         self.messages.extend([user_message, assistant_message])
         
-        user_message_count = sum(1 for msg in self.messages if msg['role'] == 'user')
-        if user_message_count > 0 and user_message_count % self.config.MEMORY_EXTRACTION_INTERVAL == 0:
-            self.extract_and_save_memory()
+        self.extract_and_save_memory()
             
         return final_response
 
@@ -403,14 +405,14 @@ class ChatAgent:
         conversation = [msg for msg in self.messages if msg['role'] in ['user', 'assistant']]
         if len(conversation) < 2: return False
         
-        full_chat_content = "\n".join([f"{m['role']}: {m['content']}" for m in conversation])
+        recent_conversation = conversation[-6:]
+        full_chat_content = "\n".join([f"{m['role']}: {m['content']}" for m in recent_conversation])
         
         now_time = datetime.datetime.now(self.tz)
         current_time_iso = now_time.isoformat()
 
-        # 更新后的Prompt，要求LLM区分永久性和临时性事实
         memory_prompt = f"""
-        请仔细阅读用户 {self.user_id} 的对话，并以JSON格式，提炼出三种信息：
+        请仔细阅读用户 {self.user_id} 的最新对话，并以JSON格式，提炼出三种信息：
         1.  `permanent_facts`: 关于用户的【核心事实】和【长期偏好】。这些信息非常稳定，几乎不会改变（例如：姓名、职业、出生地、基本价值观、不喜欢的食物）。
         2.  `temporal_facts`: 关于用户的【临时状态】或【近期事实】。这些信息在短期内有效，但可能很快过时（例如：今天的心情、最近完成的任务、本周的目标）。
         3.  `events`: 对话中提到的【未来计划】或【已经发生的具体事件】。
@@ -423,7 +425,7 @@ class ChatAgent:
         - `permanent_facts` 和 `temporal_facts` 都应该是键值对形式的JSON对象。
         - 如果对话中没有发现任何特定类型的信息，请让其对应的值为空的JSON对象或数组。例如: {{"permanent_facts": {{}}, "temporal_facts": {{"mood": "happy"}}, "events": []}}
 
-        对话内容:
+        最新对话内容:
         ---
         {full_chat_content}
         ---
@@ -431,26 +433,33 @@ class ChatAgent:
         """
         
         try:
-            response = self.client.chat.completions.create(
-                model=self.config.LLM_MODEL,
-                messages=[{"role": "user", "content": memory_prompt}],
-                response_format={"type": "json_object"}
-            )
+            with st.spinner("正在沉淀记忆..."):
+                response = self.client.chat.completions.create(
+                    model=self.config.LLM_MODEL,
+                    messages=[{"role": "user", "content": memory_prompt}],
+                    response_format={"type": "json_object"}
+                )
             content = response.choices[0].message.content
             if content and (extracted_data := json.loads(content)):
-                self.db_manager.save_structured_memory(self.user_id, extracted_data)
-                self.refresh_agent_state()
-                return True
+                has_new_data = (extracted_data.get('permanent_facts') or 
+                                extracted_data.get('temporal_facts') or 
+                                extracted_data.get('static_facts') or
+                                extracted_data.get('events'))
+                if has_new_data:
+                    self.db_manager.save_structured_memory(self.user_id, extracted_data)
+                    self.refresh_agent_state()
+                    logging.info(f"用户 {self.user_id} 的新记忆已保存。")
+                    return True
             return False
         except Exception as e:
             logging.error(f"解析或保存长期记忆失败: {e}")
             return False
 
 # -----------------------------------------------------------------------------
-# 步骤 3: Streamlit 前端界面 (V4.6 - 上传属性修复版)
+# 步骤 3: Streamlit 前端界面 (V4.9 - 时区修复版)
 # -----------------------------------------------------------------------------
 
-st.set_page_config(page_title="您的专属记忆助理 V4.6", page_icon="🧠", layout="centered")
+st.set_page_config(page_title="您的专属记忆伙伴 V4.9", page_icon="🤗", layout="centered")
 
 @st.cache_resource
 def get_core_services():
@@ -475,17 +484,16 @@ with st.sidebar:
     if st.button("登录 / 切换用户", key="login_button"):
         if user_id_input:
             if st.session_state.agent and st.session_state.logged_in_user_id != user_id_input:
-                with st.spinner("沉淀最终记忆..."): st.session_state.agent.extract_and_save_memory()
+                st.session_state.agent.extract_and_save_memory()
             
             st.session_state.logged_in_user_id = user_id_input
             
-            # 更新了提示文本和调用的函数
             with st.spinner(f"正在为您清理过期的临时记忆..."):
                 db_manager.clear_old_temporal_fact_memory(user_id_input)
                 time.sleep(1)
 
             st.session_state.agent = None
-            st.toast(f"欢迎回来, {user_id_input}！您的记忆已刷新。", icon="✅")
+            st.toast(f"欢迎回来, {user_id_input}！很高兴再次见到你。", icon="🤗")
             st.rerun()
         else: st.warning("请输入一个用户ID。")
 
@@ -494,9 +502,8 @@ with st.sidebar:
         st.markdown("---")
         
         st.header("📚 知识库 (RAG)")
-        uploaded_file = st.file_uploader("上传知识文件 (.txt/.md)", type=['txt', 'md'], key=f"uploader_{current_user_id}")
+        uploaded_file = st.file_uploader("分享一些资料给我学习 (.txt/.md)", type=['txt', 'md'], key=f"uploader_{current_user_id}")
         
-        # 检查是否是新上传的文件，且尚未被处理
         if uploaded_file is not None and uploaded_file.file_id != st.session_state.get('last_uploaded_file_id'):
             progress_container = st.empty()
             try:
@@ -506,28 +513,26 @@ with st.sidebar:
                 content = uploaded_file.getvalue().decode("utf-8")
                 db_manager.add_document_to_rag(current_user_id, uploaded_file.name, content, progress_callback=update_progress)
                 
-                # 标记文件已处理
                 st.session_state.last_uploaded_file_id = uploaded_file.file_id
                 
-                time.sleep(1) # 短暂显示完成状态
+                time.sleep(1)
                 progress_container.empty()
-                st.toast(f"文件 '{uploaded_file.name}' 已学习完成！", icon="✅")
-                st.rerun() # 安全地刷新界面
+                st.toast(f"谢谢你的分享，'{uploaded_file.name}' 我已经学习完啦！", icon="✅")
+                st.rerun()
             except Exception as e:
-                # 即使失败也要标记，防止无限重试
                 st.session_state.last_uploaded_file_id = uploaded_file.file_id
                 progress_container.empty()
                 st.error(f"处理文件失败: {e}")
         
         rag_files = db_manager.get_rag_file_list(current_user_id)
         if rag_files:
-            with st.expander("查看已上传的文件", expanded=False):
+            with st.expander("查看我学习过的资料", expanded=False):
                 for f in rag_files: st.caption(f)
-            if st.button("🗑️ 清空所有知识库文件", key="clear_rag"):
-                with st.spinner("清空知识库..."):
+            if st.button("🗑️ 忘记所有学习资料", key="clear_rag"):
+                with st.spinner("正在清空我的学习笔记..."):
                     db_manager.clear_user_rag_documents(current_user_id)
                     st.cache_data.clear()
-                st.toast("知识库已清空！", icon="🗑️")
+                st.toast("我已经忘记所有学习过的资料啦。", icon="🗑️")
                 st.rerun()
 
         st.markdown("---")
@@ -541,58 +546,61 @@ with st.sidebar:
             time.sleep(1)
             st.rerun()
 
-        if st.button("🧠 主动提炼记忆", key="extract_memory"):
+        if st.button("🧠 手动回顾一下", key="extract_memory", help="通常我会自动记忆，这个按钮可以让我立即强制回顾我们的对话。"):
             if st.session_state.agent:
-                with st.spinner("⏳ 正在分析和沉淀记忆..."):
-                    saved = st.session_state.agent.extract_and_save_memory()
+                saved = st.session_state.agent.extract_and_save_memory()
                 if saved:
-                    st.success("✅ 记忆已更新！")
+                    st.success("✅ 回顾完成，又有新收获！")
                 else:
-                    st.info("🤷‍ 未发现新的可记忆信息。")
+                    st.info("🤷‍ 暂时没有发现新的信息可以记录。")
                 time.sleep(2)
                 st.rerun()
 
-        if st.button("🧹 清理当前对话", key="clear_chat"):
+        if st.button("🧹 开始一段新对话", key="clear_chat"):
             if st.session_state.agent:
-                with st.spinner("保存最后的回忆..."): st.session_state.agent.extract_and_save_memory()
-                with st.spinner("清空对话历史..."):
+                st.session_state.agent.extract_and_save_memory()
+                with st.spinner("正在清空我们的对话..."):
                     db_manager.clear_user_chat_history(current_user_id)
                     st.cache_data.clear()
                 st.session_state.agent = None
-                st.toast("对话历史已清空！", icon="🗑️")
+                st.toast("好了，我们可以开始新的话题了！", icon="💬")
                 st.rerun()
         
-        with st.expander("👀 查看我的事实记忆 (包含永久和临时)"):
+        with st.expander("👀 看看关于你的记忆"):
             memory_content = db_manager.load_fact_memory(current_user_id)
-            st.code(memory_content, language=None) if memory_content.strip() and memory_content != "暂无" else st.info("暂无事实记忆。")
+            if memory_content.strip() and memory_content != "暂无":
+                st.code(memory_content, language=None)
+            else:
+                st.info("关于你的事，我还了解得不多。")
 
-        with st.expander("📅 查看我的事件记忆 (按时间倒序)"):
+        with st.expander("📅 看看我们的日程和事件"):
             event_memory_content = db_manager.get_all_event_memory_for_display(current_user_id)
-            st.code(event_memory_content, language=None) if event_memory_content.strip() and "暂无" not in event_memory_content else st.info("暂无事件记忆。")
+            if event_memory_content.strip() and "暂无" not in event_memory_content:
+                st.code(event_memory_content, language=None)
+            else:
+                st.info("我们之间还没有发生什么特别的事。")
 
-    else: st.caption("请先登录以使用全部功能。")
+    else: st.caption("请先登录，让我认识你。")
 
 # --- 主聊天界面 ---
-st.title("🧠 您的专属记忆助理 V4.6")
-st.caption("现在我能区分并永久保留您的核心记忆了！每次登录仅会清理过期的临时记忆。")
+st.title("🤗 您的专属记忆伙伴 V4.9")
+st.caption("我在这里，随时准备倾听、支持和陪伴。")
 if not st.session_state.logged_in_user_id:
-    st.info("👈 请在左侧边栏输入用户ID并登录。")
+    st.info("👈 请在左侧边栏输入你的ID，让我认识你吧。")
     st.stop()
 try:
     if st.session_state.agent is None:
         st.session_state.agent = ChatAgent(config, db_manager, api_key, st.session_state.logged_in_user_id)
 except Exception as e:
-    st.error(f"初始化助理出错: {e}")
+    st.error(f"初始化伙伴时出错了: {e}")
     st.stop()
 
+# 只显示对话消息，隐藏系统消息
 for message in st.session_state.agent.messages:
     if message["role"] in ["user", "assistant"]:
         with st.chat_message(message["role"]): st.markdown(message["content"])
 
-if prompt := st.chat_input(f"您好, {st.session_state.logged_in_user_id}, 有何贵干?"):
+if prompt := st.chat_input(f"嗨, {st.session_state.logged_in_user_id}, 在想些什么呢?"):
     st.chat_message("user").markdown(prompt)
-    with st.spinner("思考中..."):
-        response = st.session_state.agent.run(prompt)
-    with st.chat_message("assistant"):
-        st.markdown(response)
+    response = st.session_state.agent.run(prompt)
     st.rerun()
