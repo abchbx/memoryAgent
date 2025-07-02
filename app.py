@@ -1,16 +1,5 @@
 # -*- coding: utf-8 -*-
 # -----------------------------------------------------------------------------
-# 您的专属记忆伙伴 V5.2 - UI同步优化版
-#
-# 更新日志 (V5.2):
-# - UI同步: 重构了前端数据的加载方式。现在，侧边栏的“记忆”和“事件”面板会直接从AI伙伴的实时状态中读取信息。
-# - 实时更新: 当记忆被提取和保存后，UI会立即、同步地反映出这些变化，确保了数据的强一致性，解决了之前版本中可能出现的显示延迟问题。
-#
-# 更新日志 (V5.1):
-# - 核心重构: 引入了基于LLM的智能事件管理系统，通过唯一`event_id`来精确管理事件的增删改查。
-# -----------------------------------------------------------------------------
-
-# -----------------------------------------------------------------------------
 # 步骤 1: 导入所有必要的库
 # -----------------------------------------------------------------------------
 import os
@@ -25,9 +14,10 @@ from dotenv import load_dotenv
 import chromadb
 from chromadb.utils import embedding_functions
 import hashlib
+import re
 
 # -----------------------------------------------------------------------------
-# 步骤 2: 后端逻辑代码 (V5.2 - UI同步优化版)
+# 步骤 2: 后端逻辑代码
 # -----------------------------------------------------------------------------
 
 # --- 日志记录配置 ---
@@ -38,15 +28,15 @@ class Config:
     """集中管理所有配置"""
     load_dotenv()
     ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
-    LLM_MODEL = "glm-4-flash-250414"
-    EMBEDDING_MODEL = "D:\\Personal\\Documents\\agent\\memoryAgent\\bge-base-zh-v1.5" # 填入本地向量模型地址
-    DB_PATH = "D:\\Personal\\Documents\\agent\\memoryAgent\\user_centric_db_v5.2" # V5.2: 数据库路径
+    LLM_MODEL = "glm-4-flash"
+    THINKING_MODEL = "glm-z1-flash"
+    EMBEDDING_MODEL = "<填入向量模型地址>"
+    DB_PATH = "<数据存储路径>" 
     CHAT_COLLECTION_NAME = "user_chat_history"
     FACT_MEMORY_COLLECTION_NAME = "user_fact_memory"
     EVENT_MEMORY_COLLECTION_NAME = "user_event_memory"
     RAG_COLLECTION_NAME = "user_rag_documents"
     TIMEZONE = "Asia/Shanghai"
-
     SYSTEM_PROMPT_TEMPLATE = """
     你是一位为用户 {user_id} 服务的、充满温度与支持的私人伙伴。
 
@@ -54,20 +44,30 @@ class Config:
     - **成为伙伴, 而非老师**: 你的首要目标是成为一个乐于助人、有同理心的伙伴。你的角色不是纠正用户的错误，而是陪伴和支持他们梳理思绪、规划生活。
     - **积极、鼓励、有温度**: 始终保持积极和鼓励的态度。在回应时，多一些关心和理解，少一些生硬的指令和说教。
     - **个性化互动**: 像一个真正的朋友一样，自然地运用我为你提供的所有信息（用户的个人事实、事件记忆、知识库等），以便更好地理解上下文，并给出贴心、个性化的回应。
+    - **【重要】思考过程**: 当你需要复杂思考时，请使用 <think>...</think> 标签包裹你的思考步骤。这部分内容不会展示给用户，但有助于你理清思路，给出更高质量的回答。例如: "<think>用户提到了明天的会议，我需要检查一下他的日程。查到了，是下午3点。好的，现在可以回答了。</think>没问题，已经帮你记下了，明天下午3点的会议。"
 
     # 参考信息 (我会为你提供):
-    - **当前时间**: {current_time}
-    - **关于用户的记忆**:
-        - **长期事实**: {long_term_memory}
-        - **未来计划**: {future_events}
-        - **近期事件**: {past_events}
+    
+    ## 1. 时间与日期
+    - **当前精确时间**: {current_time}
+    - **未来一周日期参考**: 
+      为了帮助你准确计算日期，这里是接下来一周的日期信息。**请优先使用此信息回答与日期相关的问题。**
+      {date_reference}
+
+    ## 2. 关于用户的记忆
+    - **长期事实**: {long_term_memory}
+    - **未来计划**: {future_events}
+    - **近期事件**: {past_events}
 
     # 你的回应方式:
     - 深入理解用户的意图，结合所有已知信息，生成一个自然、流畅、且充满伙伴感的回答。
     - 如果知识库信息相关，请以一种建议或“我发现这个可能有用”的口吻来分享，而不是作为绝对事实。
     """
 
-# --- 文本分割器 ---
+def process_response_for_display(content: str) -> str:
+    """使用正则表达式移除<think>...</think>标签及其中的所有内容。"""
+    return re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+
 def simple_text_splitter(text: str, max_chunk_size: int = 500) -> list[str]:
     """一个简单的文本分割器，按句子分割"""
     sentences = text.replace("\n", " ").replace("\r", " ").split('。')
@@ -83,7 +83,6 @@ def simple_text_splitter(text: str, max_chunk_size: int = 500) -> list[str]:
     if current_chunk: chunks.append(current_chunk.strip())
     return chunks
 
-# --- 数据库管理类 ---
 class ChatHistoryDB:
     def __init__(self, config: Config):
         self.config = config
@@ -407,20 +406,41 @@ class ChatAgent:
         self.client = OpenAI(api_key=api_key, base_url=self.config.ZHIPU_BASE_URL)
         self.refresh_agent_state()
 
+    def _get_date_reference(self, now: datetime.datetime) -> str:
+        """创建未来一周的日期参考字符串"""
+        weekdays_zh = {"Monday": "星期一", "Tuesday": "星期二", "Wednesday": "星期三", 
+                       "Thursday": "星期四", "Friday": "星期五", "Saturday": "星期六", "Sunday": "星期日"}
+        date_references = []
+        for i in range(7):
+            future_date = now + datetime.timedelta(days=i)
+            day_name = ""
+            if i == 0: day_name = " (今天)"
+            elif i == 1: day_name = " (明天)"
+            elif i == 2: day_name = " (后天)"
+            
+            weekday_en = future_date.strftime('%A')
+            weekday_zh = weekdays_zh.get(weekday_en, weekday_en)
+            
+            date_references.append(
+                f"  - {future_date.strftime('%Y-%m-%d')}{day_name}, {weekday_zh}"
+            )
+        return "\n".join(date_references)
+
     def refresh_agent_state(self, query: str = None):
-        """V5.2: 刷新代理状态，加载所有记忆到自身属性，确保UI同步"""
-        # 加载记忆并存储为实例属性
+        """刷新代理状态时，注入精确的日期参考信息"""
         self.fact_memory_str = self.db_manager.load_fact_memory(self.user_id)
         self.future_events_str, self.past_events_str = self.db_manager.load_event_memory(self.user_id, query=query)
         self.all_events_display_str = self.db_manager.get_all_event_memory_for_display(self.user_id)
         
         now_time = datetime.datetime.now(self.tz)
         current_time_str = now_time.strftime('%Y-%m-%d %H:%M:%S %Z')
+        
+        date_reference_str = self._get_date_reference(now_time)
 
-        # 使用实例属性构建系统提示
         system_prompt = self.config.SYSTEM_PROMPT_TEMPLATE.format(
             user_id=self.user_id,
             current_time=current_time_str,
+            date_reference=date_reference_str,
             long_term_memory=self.fact_memory_str,
             future_events=self.future_events_str,
             past_events=self.past_events_str
@@ -433,8 +453,13 @@ class ChatAgent:
             self.messages[0]['content'] = system_prompt
 
     def run(self, user_input: str):
+        """
+        【V5.6 修改】: 重构状态管理，确保在所有写入操作后才刷新状态。
+        """
+        # 1. 刷新状态，为当前对话准备上下文
         self.refresh_agent_state(query=user_input)
         
+        # 2. 准备发送给 LLM 的消息列表
         context_from_rag = self.db_manager.query_rag_documents(self.user_id, user_input)
         context_from_history = self.db_manager.query_recent_discussions(self.user_id, user_input)
         
@@ -444,26 +469,47 @@ class ChatAgent:
         
         messages_for_llm.append({"role": "user", "content": user_input})
         
+        use_thinking_model = st.session_state.get('use_thinking_model', False)
+        model_to_use = self.config.THINKING_MODEL if use_thinking_model else self.config.LLM_MODEL
+        logging.info(f"正在使用模型: {model_to_use}")
+
+        # 3. 调用 LLM 并流式生成响应
+        full_response_content = ""
         try:
-            response = self.client.chat.completions.create(model=self.config.LLM_MODEL, messages=messages_for_llm)
-            final_response = response.choices[0].message.content or "抱歉，我不知道如何回复。"
+            stream = self.client.chat.completions.create(
+                model=model_to_use, 
+                messages=messages_for_llm,
+                stream=True
+            )
+            for chunk in stream:
+                content_chunk = chunk.choices[0].delta.content or ""
+                full_response_content += content_chunk
+                yield content_chunk
+                
         except Exception as e:
             logging.error(f"调用LLM API失败: {e}")
-            final_response = f"抱歉，出错了: {e}"
-            
-        user_message = {"role": "user", "content": user_input}
-        assistant_message = {"role": "assistant", "content": final_response}
+            full_response_content = f"抱歉，出错了: {e}"
+            yield full_response_content
         
+        # --- 流式输出结束后，执行后续的写入和状态更新 ---
+        
+        # 4. 更新内存中的对话历史
+        user_message = {"role": "user", "content": user_input}
+        assistant_message = {"role": "assistant", "content": full_response_content}
+        self.messages.extend([user_message, assistant_message])
+        
+        # 5. 将新对话写入数据库
         self.db_manager.save_message(self.user_id, user_message)
         self.db_manager.save_message(self.user_id, assistant_message)
         
-        self.messages.extend([user_message, assistant_message])
-        
+        # 6. 提取并写入新的记忆到数据库
         self.extract_and_save_memory()
-            
-        return final_response
+        
+        # 7. 在所有写入操作完成后，最后统一刷新一次状态，确保下一轮对话的上下文是完整的
+        self.refresh_agent_state()
 
     def extract_and_save_memory(self):
+        """【V5.6 修改】: 移除此函数中的状态刷新，交由主流程 run() 统一管理"""
         conversation = [msg for msg in self.messages if msg['role'] in ['user', 'assistant']]
         if len(conversation) < 2: return False
         
@@ -476,11 +522,14 @@ class ChatAgent:
         existing_events = self.db_manager.get_all_events_for_llm(self.user_id)
         existing_events_str = json.dumps(existing_events, ensure_ascii=False, indent=2) if existing_events else "[]"
 
+        date_reference_str = self._get_date_reference(now_time)
         memory_prompt = f"""
         你现在是一位为用户 {self.user_id} 服务的、高效的记忆管家。你的核心任务是分析最新的对话，并管理用户的个人信息和日程事件。
 
         # 1. 已有信息参考
-        - **当前时间**: `{current_time_iso}`
+        - **当前精确时间**: `{current_time_iso}`
+        - **未来一周日期参考 (用于精确解析时间)**:
+{date_reference_str}
         - **已记录的日程事件**: 
         ```json
         {existing_events_str}
@@ -508,7 +557,7 @@ class ChatAgent:
                 - 如果是**更新事件**，请从“已记录的日程事件”列表中找到并使用**完全相同**的 `event_id`。
             - `data`:
                 - `description`: 事件的完整描述。
-                - `event_time_iso`: **必须**将对话中的时间（如“明天下午3点”）解析为标准的ISO 8601格式 (`YYYY-MM-DDTHH:MM:SS±HH:MM`)。
+                - `event_time_iso`: **必须**将对话中的时间（如“明天下午3点”）**严格参照上面提供的日期参考**，解析为标准的ISO 8601格式 (`YYYY-MM-DDTHH:MM:SS±HH:MM`)。
 
         2.  **删除事件 (`delete`)**:
             - `type`: "delete"
@@ -528,19 +577,17 @@ class ChatAgent:
         """
         
         try:
-            with st.spinner("正在沉淀记忆..."):
-                response = self.client.chat.completions.create(
-                    model=self.config.LLM_MODEL,
-                    messages=[{"role": "user", "content": memory_prompt}],
-                    response_format={"type": "json_object"}
-                )
+            response = self.client.chat.completions.create(
+                model=self.config.LLM_MODEL,
+                messages=[{"role": "user", "content": memory_prompt}],
+                response_format={"type": "json_object"}
+            )
             content = response.choices[0].message.content
             if content and (extracted_data := json.loads(content)):
                 has_new_data = (extracted_data.get('permanent_facts') or 
                                 extracted_data.get('event_actions'))
                 if has_new_data:
                     self.db_manager.save_structured_memory(self.user_id, extracted_data)
-                    self.refresh_agent_state() # 关键：保存后立即刷新自身状态
                     logging.info(f"用户 {self.user_id} 的新记忆已处理。")
                     return True
             return False
@@ -569,6 +616,8 @@ if not api_key:
 if "logged_in_user_id" not in st.session_state: st.session_state.logged_in_user_id = None
 if "agent" not in st.session_state: st.session_state.agent = None
 if "last_uploaded_file_id" not in st.session_state: st.session_state.last_uploaded_file_id = None
+if 'use_thinking_model' not in st.session_state: st.session_state.use_thinking_model = False
+
 
 # --- 侧边栏 ---
 with st.sidebar:
@@ -596,6 +645,15 @@ with st.sidebar:
 
     if st.session_state.logged_in_user_id:
         current_user_id = st.session_state.logged_in_user_id
+        st.markdown("---")
+        
+        st.header("⚙️ 模型设置")
+        use_thinking_model_toggle = st.toggle(
+            f"启用高级思考模型 ({config.THINKING_MODEL})", 
+            key='use_thinking_model', 
+            help=f"开启后，对话将使用更强大的 {config.THINKING_MODEL} 模型。默认使用 {config.LLM_MODEL}。"
+        )
+
         st.markdown("---")
         
         st.header("📚 知识库 (RAG)")
@@ -645,7 +703,10 @@ with st.sidebar:
 
         if st.button("🧠 手动回顾一下", key="extract_memory", help="通常我会自动记忆，这个按钮可以让我立即强制回顾我们的对话。"):
             if st.session_state.agent:
-                saved = st.session_state.agent.extract_and_save_memory()
+                with st.spinner("正在强制回顾对话..."):
+                    saved = st.session_state.agent.extract_and_save_memory()
+                    # 在手动回顾后也刷新一次主状态
+                    st.session_state.agent.refresh_agent_state()
                 if saved:
                     st.success("✅ 回顾完成，又有新收获！")
                 else:
@@ -663,7 +724,6 @@ with st.sidebar:
                 st.toast("好了，我们可以开始新的话题了！", icon="💬")
                 st.rerun()
         
-        # V5.2: UI直接从agent的实时状态中读取信息
         with st.expander("👀 看看关于你的记忆"):
             if 'agent' in st.session_state and st.session_state.agent:
                 memory_content = st.session_state.agent.fact_memory_str
@@ -683,7 +743,7 @@ with st.sidebar:
     else: st.caption("请先登录，让我认识你。")
 
 # --- 主聊天界面 ---
-st.title("🤗 您的专属记忆伙伴 V5.2")
+st.title("🤗 您的专属记忆伙伴 V5.6")
 st.caption("我在这里，随时准备倾听、支持和陪伴。")
 if not st.session_state.logged_in_user_id:
     st.info("👈 请在左侧边栏输入你的ID，让我认识你吧。")
@@ -695,12 +755,24 @@ except Exception as e:
     st.error(f"初始化伙伴时出错了: {e}")
     st.stop()
 
-# 只显示对话消息，隐藏系统消息
 for message in st.session_state.agent.messages:
     if message["role"] in ["user", "assistant"]:
-        with st.chat_message(message["role"]): st.markdown(message["content"])
+        with st.chat_message(message["role"]):
+            content_to_display = message["content"]
+            if message["role"] == "assistant":
+                content_to_display = process_response_for_display(content_to_display)
+            
+            if content_to_display:
+                st.markdown(content_to_display)
 
 if prompt := st.chat_input(f"嗨, {st.session_state.logged_in_user_id}, 在想些什么呢?"):
-    st.chat_message("user").markdown(prompt)
-    response = st.session_state.agent.run(prompt)
-    st.rerun()
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        full_response = ""
+        for chunk in st.session_state.agent.run(prompt):
+            full_response += chunk
+            placeholder.markdown(process_response_for_display(full_response) + "▌")
+        placeholder.markdown(process_response_for_display(full_response))
